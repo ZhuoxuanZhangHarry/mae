@@ -159,33 +159,6 @@ def get_args_parser():
                         help='url used to set up distributed training')
 
     return parser
-def save_image(image_array, file_name):
-    """
-    Save an image from a numpy array.
-
-    :param image_array: Numpy array representing the image.
-    :param file_name: File name or path where the image will be saved.
-    """
-    # Convert to a PIL Image
-    image = PIL.Image.fromarray((image_array * 255).astype(np.uint8))
-
-    # Save the image
-    image.save(file_name)
-
-# Example usage:
-# Assuming y[0] is a numpy array representing an image
-
-def run_one_image(img, model):
-    x = torch.tensor(img)
-    print('x shape 1', x.shape)
-    # make it a batch-like
-    x = x.unsqueeze(dim=0)
-    print('x shape 2', x.shape)
-    # run MAE
-    print("x", x.shape)
-    loss, y, mask = model(x.float(), mask_ratio=0.75)
-    print("y shape: ", y.shape)
-    print("loss: ", loss)
 
 def load_classifier_model(checkpoint_path, pretrained_model):
     if checkpoint_path:
@@ -207,7 +180,37 @@ def prepare_model(chkpt_dir, arch='mae_vit_large_patch16'):
     return model
 
 @torch.no_grad()
-def evaluate_DRAM(mae_model, data_loader, device):
+@torch.cuda.amp.autocast()
+def eval_DRAM(classifier_model, ori_imgs, adv_imgs, rec_imgs, target):
+    output_ori = classifier_model(ori_imgs)
+    pre = torch.max(output_ori.data, 1)
+    correct_ori = (pre == target).sum()
+    
+    output_adv = classifier_model(adv_imgs)
+    pre = torch.max(output_adv.data, 1)
+    correct_adv = (pre == target).sum()
+
+    output_rec = classifier_model(rec_imgs)
+    pre = torch.max(output_rec.data, 1)
+    correct_rec = (pre == target).sum()
+
+    return correct_ori, correct_adv, correct_rec
+
+
+@torch.no_grad()
+@torch.cuda.amp.autocast()
+def DRAM_reconstruct(mae_model, adv_imgs, mask_ratio=0.75):
+    loss, patched_adv_imgs, mask = mae_model(adv_imgs, mask_ratio=0.75)
+    # mse loss over patches
+    # [batch, patch_num, patch_size**2 * C]
+    # TODO:
+    adv_imgs = mae_model.unpatchify(patched_adv_imgs)
+
+    return adv_imgs
+
+@torch.no_grad()
+@torch.cuda.amp.autocast()
+def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
     # set up logger
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -226,25 +229,27 @@ def evaluate_DRAM(mae_model, data_loader, device):
     MSE_criterion = nn.MSELoss()
     Entropy_loss = nn.CrossEntropyLoss()
 
-    # loss lst
-    loss_lst = []
+    # total correctness
+    correct_ori = 0
+    correct_adv = 0
+    correct_rec = 0
 
-    # future TODO: use vector instead of for loop?
-    for imgs, target in metric_logger.log_every(data_loader, 10, header):
-        imgs = imgs.to(device, non_blocking=True)
+    # iterate ori dataset along with adv
+    data_loader_ori_iter = iter(data_loader_ori)
+
+    for adv_imgs, target in metric_logger.log_every(data_loader_adv, 10, header):
+        adv_imgs = adv_imgs.to(device, non_blocking=True)
         # [batch, Channel=3, Height, Width]
         target = target.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast():
-            loss, pred, mask = mae_model(imgs, mask_ratio=0.75)
-            # mse loss over patches
-            # [batch, patch_num, patch_size**2 * C]
+        ori_imgs = data_loader_ori_iter[0].to(device, non_blocking=True)
 
-            rec_imgs = imgs
+        ## TODO: reconstruct imgs to eliminate patch
+        rec_imgs = DRAM_reconstruct(mae_model, adv_imgs, mask_ratio=0.75)
 
-            ## TODO: perform patch attack on imgs
-
-            ## TODO: reconstruct imgs
+        # eval accuracy ori vs adv vs recon
+        correct_ori, correct_adv, correct_rec += eval_DRAM(classifier_model, ori_imgs, 
+                                                           adv_imgs, rec_imgs, target)
     return
 
 
@@ -264,12 +269,24 @@ def main(args):
     cudnn.benchmark = True
 
     # load data
-    dataset = build_dataset(is_train=False, args=args)
+    dataset_adv = build_dataset(is_train=False, args=args)
+    sampler_adv = torch.utils.data.SequentialSampler(dataset_adv)
 
-    sampler = torch.utils.data.SequentialSampler(dataset)
+    # if args.eval:
+    # TODO: load adv set later
+    dataset_ori = build_dataset(is_train=False, args=args)
+    sampler_ori = torch.utils.data.SequentialSampler(dataset_ori)
 
-    data_loader = torch.utils.data.DataLoader(
-        dataset, sampler=sampler,
+    data_loader_adv = torch.utils.data.DataLoader(
+        dataset_adv, sampler=sampler_adv,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False
+    )
+
+    data_loader_ori = torch.utils.data.DataLoader(
+        dataset_ori, sampler=sampler_ori,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
@@ -288,8 +305,8 @@ def main(args):
     print("Model = %s" % str(model_without_ddp))
 
     # eval
-    test_stats = evaluate_DRAM(mae_model, data_loader, device)
-    print(f"Accuracy of the network on the {len(dataset)} test images: {test_stats['acc1']:.1f}%")
+    test_stats = engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device)
+    print(f"Accuracy of the network on the {len(dataset_adv)} test images: {test_stats['acc1']:.1f}%")
 
 if __name__ == '__main__':
     args = get_args_parser()
