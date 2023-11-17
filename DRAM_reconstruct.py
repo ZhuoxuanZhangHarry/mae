@@ -183,15 +183,15 @@ def prepare_model(chkpt_dir, arch='mae_vit_large_patch16'):
 @torch.cuda.amp.autocast()
 def eval_DRAM(classifier_model, ori_imgs, adv_imgs, rec_imgs, target):
     output_ori = classifier_model(ori_imgs)
-    pre = torch.max(output_ori.data, 1)
+    _, pre = torch.max(output_ori.data, 1)
     correct_ori = (pre == target).sum()
     
     output_adv = classifier_model(adv_imgs)
-    pre = torch.max(output_adv.data, 1)
+    _, pre = torch.max(output_adv.data, 1)
     correct_adv = (pre == target).sum()
 
     output_rec = classifier_model(rec_imgs)
-    pre = torch.max(output_rec.data, 1)
+    _, pre = torch.max(output_rec.data, 1)
     correct_rec = (pre == target).sum()
 
     return correct_ori, correct_adv, correct_rec
@@ -219,8 +219,6 @@ def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
     classifier_model = torchvision.models.resnet50(pretrained=True)
     classifier_model = classifier_model.to(device)
 
-    classifier_model = load_classifier_model("/local/rcs/yunyun/SSDG-main/resnet50.pth", classifier_model)
-
     # switch to evaluation mode
     classifier_model.eval()
     mae_model.eval()
@@ -230,26 +228,53 @@ def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
     Entropy_loss = nn.CrossEntropyLoss()
 
     # total correctness
-    correct_ori = 0
-    correct_adv = 0
-    correct_rec = 0
+    total_correct_ori = 0
+    total_correct_adv = 0
+    total_correct_rec = 0
+
+    # test_size
+    test_size = 0
 
     # iterate ori dataset along with adv
     data_loader_ori_iter = iter(data_loader_ori)
 
-    for adv_imgs, target in metric_logger.log_every(data_loader_adv, 10, header):
+    for step, (adv_imgs, target) in enumerate(metric_logger.log_every(data_loader_adv, 10, header)):
         adv_imgs = adv_imgs.to(device, non_blocking=True)
         # [batch, Channel=3, Height, Width]
         target = target.to(device, non_blocking=True)
 
-        ori_imgs = data_loader_ori_iter[0].to(device, non_blocking=True)
+        ori_imgs = next(data_loader_ori_iter)[0].to(device, non_blocking=True)
 
         ## TODO: reconstruct imgs to eliminate patch
-        rec_imgs = DRAM_reconstruct(mae_model, adv_imgs, mask_ratio=0.75)
+        # rec_imgs = DRAM_reconstruct(mae_model, adv_imgs, mask_ratio=0.75)
+        rec_imgs = ori_imgs
 
         # eval accuracy ori vs adv vs recon
-        correct_ori, correct_adv, correct_rec += eval_DRAM(classifier_model, ori_imgs, 
+        correct_ori, correct_adv, correct_rec = eval_DRAM(classifier_model, ori_imgs, 
                                                            adv_imgs, rec_imgs, target)
+        batch_size = adv_imgs.shape[0]
+        print("batch_size: ", batch_size)
+        print("correct_ori.item(): ", correct_ori.item())
+        print("correct_adv.item(): ", correct_adv.item())
+        print("correct_rec.item(): ", correct_rec.item())
+        
+        # TODO: delete later
+        if step == 5:
+            break
+
+        print('correct before attack --> ', correct_ori.item()/batch_size) 
+        print('correct after attack --> ', correct_adv.item()/batch_size)
+        print('correct after reconstruction --> ', correct_rec.item()/batch_size)
+
+        # exit(0)
+        test_size += batch_size
+        total_correct_ori += correct_ori
+        total_correct_adv += correct_adv
+        total_correct_rec += correct_rec
+    
+    print('total correct before attack --> ', total_correct_ori.item()/test_size) 
+    print('total correct after attack --> ', total_correct_adv.item()/test_size)
+    print('total correct after reconstruction --> ', total_correct_rec.item()/test_size)
     return
 
 
