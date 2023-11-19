@@ -195,29 +195,37 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x
 
-    def forward_loss(self, imgs, pred, mask):
-        """
-        imgs: [N, 3, H, W]
-        pred: [N, L, p*p*3]
-        mask: [N, L], 0 is keep, 1 is remove, 
-        """
-        target = self.patchify(imgs)
-        if self.norm_pix_loss:
-            mean = target.mean(dim=-1, keepdim=True)
-            var = target.var(dim=-1, keepdim=True)
-            target = (target - mean) / (var + 1.e-6)**.5
-
-        loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
-
-        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
-        return loss
-
-    def forward(self, imgs, mask_ratio=0.75):
+    def forward(self, imgs, specific_patches, mask_ratio=0.75):
+        # encoder
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
-        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
-        loss = self.forward_loss(imgs, pred, mask)
-        return loss, pred, mask
+
+        # decoder
+        pred = self.forward_decoder(latent, ids_restore)  
+        # [N, L, p*p*3]
+
+        # prepare for selective patch replacement
+        N, _, _ = pred.shape
+        p = self.patch_embed.patch_size[0]
+        
+        # original image dimensions divided by patch size
+        H, W = imgs.shape[2] // p, imgs.shape[3] // p
+    
+        # Convert imgs and pred to patch representation
+        imgs_patches = self.patchify(imgs)  
+        # [N, L, patch_size**2 *3]
+        pred_patches = pred.view(N, H, W, p, p, 3)
+
+        # selectively replace specific patches
+        for patch_idx in specific_patches:
+            # get 2D patch index
+            h_idx, w_idx = divmod(patch_idx, W)
+            imgs_patches[:, patch_idx, :] = pred_patches[:, h_idx, w_idx, :, :, :].reshape(N, -1)
+
+        # reconstruct the final image with selective replacement
+        final_imgs = self.unpatchify(imgs_patches)
+
+        return final_imgs
+
 
 
 def mae_vit_base_patch16_dec512d8b(**kwargs):

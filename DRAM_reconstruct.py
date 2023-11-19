@@ -1,46 +1,21 @@
-import math
-import sys
-from typing import Iterable, Optional
-
 import torch
 import torch.nn as nn
-import PIL
-from timm.data import Mixup
-from timm.utils import accuracy
-from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from einops import rearrange
+from PIL import Image
 import util.misc as misc
-import util.lr_sched as lr_sched
 
 import argparse
-import datetime
-import json
 import numpy as np
 import os
-import time
-import torchvision.transforms as transforms
-import timm.optim.optim_factory as optim_factory
 
 from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
 import torchvision
-import timm
-import torchvision.datasets as datasets
-# assert timm.__version__ == "0.3.2" # version check
-from timm.models.layers import trunc_normal_
-from timm.data.mixup import Mixup
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
-
-import util.lr_decay as lrd
+from torchvision import transforms
 import util.misc as misc
 from util.datasets import build_dataset
-from util.pos_embed import interpolate_pos_embed
-from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
-import models_vit
 import models_mae
 
 def get_args_parser():
@@ -196,17 +171,69 @@ def eval_DRAM(classifier_model, ori_imgs, adv_imgs, rec_imgs, target):
 
     return correct_ori, correct_adv, correct_rec
 
+def save_tensor_as_image(tensor, filename):
+    # Define the inverse transformation
+    inverse_transform = transforms.Compose([
+        transforms.Normalize(
+            mean=[-0.485/0.229, -0.456/0.224, -0.406/0.255], 
+            std=[1/0.229, 1/0.224, 1/0.255]
+        ),
+        transforms.ToPILImage()
+    ])
+    # Remove the batch dimension and apply the inverse transform
+    image = inverse_transform(tensor.squeeze(0))
+    # Save the image
+    image.save(filename)
+
+# TODO: For testing purpose, remove later
+@torch.no_grad()
+def test_DRAM(classifier_model, mae_model, device, target):
+    # Define the transformation
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),     # Resize the image to 224x224 pixels
+        transforms.ToTensor(),             # Convert the image to a PyTorch tensor
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # Normalize for ResNet50
+    ])
+
+    ori_img = Image.open("/home/paperspace/DRAM/zhuoxuan_mae/mae/ILSVRC2012_val_00018075.JPEG")
+    ori_img = transform(ori_img)
+    ori_img = ori_img.unsqueeze(0) 
+    print("ori_img.shape: ", ori_img.shape)
+    save_tensor_as_image(ori_img, 'original_image.jpg')
+    ori_img = ori_img.to(device)
+    output_ori = classifier_model(ori_img)
+    pre = torch.max(output_ori)
+    print("ori: ", pre)
+    
+    adv_img = Image.open("/home/paperspace/DRAM/zhuoxuan_mae/mae/ILSVRC2012_val_00018075.png")
+    adv_img = transform(adv_img)
+    adv_img = adv_img.unsqueeze(0) 
+    print("adv_img.shape: ", adv_img.shape)
+    save_tensor_as_image(adv_img, 'adv_img.jpg')
+    adv_img = adv_img.to(device)
+    output_adv = classifier_model(adv_img)
+    pre = torch.max(output_adv)
+    print("adv: ", pre)
+
+    rec_img = DRAM_reconstruct(mae_model, adv_img, mask_ratio=0.75)
+    save_tensor_as_image(rec_img, 'rec_img.jpg')
+    output_rec = classifier_model(rec_img)
+    pre = torch.max(output_rec)
+    print("rec: ", pre)
 
 @torch.no_grad()
 @torch.cuda.amp.autocast()
-def DRAM_reconstruct(mae_model, adv_imgs, mask_ratio=0.75):
-    loss, patched_adv_imgs, mask = mae_model(adv_imgs, mask_ratio=0.75)
-    # mse loss over patches
-    # [batch, patch_num, patch_size**2 * C]
-    # TODO:
-    adv_imgs = mae_model.unpatchify(patched_adv_imgs)
+def DRAM_reconstruct(mae_model, adv_imgs, mask_ratio=0.75, iteration=200):
+    # TODO: detect which patches are attacked
+    attacked_patches = [2, 3, 4, 5, 6]
 
-    return adv_imgs
+    for _ in range(iteration):
+        # recon attacked_patches only. 
+        # rec_img = adv_img_benign + rec_adv_img_attacked
+        rec_imgs = mae_model(adv_imgs, attacked_patches, mask_ratio)
+        # [batch, Channel=3, Height, Width]
+
+    return rec_imgs
 
 @torch.no_grad()
 @torch.cuda.amp.autocast()
@@ -223,10 +250,6 @@ def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
     classifier_model.eval()
     mae_model.eval()
 
-    # loss func
-    MSE_criterion = nn.MSELoss()
-    Entropy_loss = nn.CrossEntropyLoss()
-
     # total correctness
     total_correct_ori = 0
     total_correct_adv = 0
@@ -238,6 +261,7 @@ def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
     # iterate ori dataset along with adv
     data_loader_ori_iter = iter(data_loader_ori)
 
+    # TODO: why batch is always 1? check data_loader
     for step, (adv_imgs, target) in enumerate(metric_logger.log_every(data_loader_adv, 10, header)):
         adv_imgs = adv_imgs.to(device, non_blocking=True)
         # [batch, Channel=3, Height, Width]
@@ -246,10 +270,12 @@ def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
         ori_imgs = next(data_loader_ori_iter)[0].to(device, non_blocking=True)
 
         ## TODO: reconstruct imgs to eliminate patch
-        # rec_imgs = DRAM_reconstruct(mae_model, adv_imgs, mask_ratio=0.75)
+        rec_imgs = DRAM_reconstruct(mae_model, adv_imgs, mask_ratio=0.75)
         rec_imgs = ori_imgs
 
         # eval accuracy ori vs adv vs recon
+        test_DRAM(classifier_model, mae_model, device, target)
+        exit(0)
         correct_ori, correct_adv, correct_rec = eval_DRAM(classifier_model, ori_imgs, 
                                                            adv_imgs, rec_imgs, target)
         batch_size = adv_imgs.shape[0]
