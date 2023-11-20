@@ -15,16 +15,13 @@ import torchvision
 from torchvision import transforms
 import util.misc as misc
 from util.datasets import build_dataset
-
+from patch_attack import generate_adversarial_image
 import models_mae
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
+    parser = argparse.ArgumentParser('DRAM_reconstruction for image classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=50, type=int)
-    parser.add_argument('--accum_iter', default=1, type=int,
-                        help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
     parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
@@ -109,7 +106,7 @@ def get_args_parser():
                         help='path where to tensorboard log')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
-    parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--seed', default=2, type=int)
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
 
@@ -261,7 +258,6 @@ def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
     # iterate ori dataset along with adv
     data_loader_ori_iter = iter(data_loader_ori)
 
-    # TODO: why batch is always 1? check data_loader
     for step, (adv_imgs, target) in enumerate(metric_logger.log_every(data_loader_adv, 10, header)):
         adv_imgs = adv_imgs.to(device, non_blocking=True)
         # [batch, Channel=3, Height, Width]
@@ -271,11 +267,12 @@ def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
 
         ## TODO: reconstruct imgs to eliminate patch
         rec_imgs = DRAM_reconstruct(mae_model, adv_imgs, mask_ratio=0.75)
-        rec_imgs = ori_imgs
 
-        # eval accuracy ori vs adv vs recon
+        ## TODO: we test it on golden fish
         test_DRAM(classifier_model, mae_model, device, target)
         exit(0)
+
+        # eval accuracy ori vs adv vs recon
         correct_ori, correct_adv, correct_rec = eval_DRAM(classifier_model, ori_imgs, 
                                                            adv_imgs, rec_imgs, target)
         batch_size = adv_imgs.shape[0]
@@ -284,7 +281,7 @@ def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
         print("correct_adv.item(): ", correct_adv.item())
         print("correct_rec.item(): ", correct_rec.item())
         
-        # TODO: delete later
+        # we test for 5 steps
         if step == 5:
             break
 
@@ -292,7 +289,6 @@ def engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device):
         print('correct after attack --> ', correct_adv.item()/batch_size)
         print('correct after reconstruction --> ', correct_rec.item()/batch_size)
 
-        # exit(0)
         test_size += batch_size
         total_correct_ori += correct_ori
         total_correct_adv += correct_adv
@@ -324,7 +320,6 @@ def main(args):
     sampler_adv = torch.utils.data.SequentialSampler(dataset_adv)
 
     # if args.eval:
-    # TODO: load adv set later
     dataset_ori = build_dataset(is_train=False, args=args)
     sampler_ori = torch.utils.data.SequentialSampler(dataset_ori)
 
@@ -356,12 +351,9 @@ def main(args):
     print("Model = %s" % str(model_without_ddp))
 
     # eval
-    test_stats = engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device)
-    print(f"Accuracy of the network on the {len(dataset_adv)} test images: {test_stats['acc1']:.1f}%")
+    engine_DRAM(mae_model, data_loader_adv, data_loader_ori, device)
 
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
